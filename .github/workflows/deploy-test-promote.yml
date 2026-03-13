@@ -1,0 +1,176 @@
+name: Staging Push -> Run Appium Tests -> Approve -> Deploy Prod
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+  statuses: write
+
+concurrency:
+  group: staging-to-prod
+  cancel-in-progress: true
+
+jobs:
+  run_staging_tests:
+    name: Run Appium Tests Against Staging
+    runs-on: ubuntu-latest
+    outputs:
+      run_url: ${{ steps.wait_tests.outputs.run_url }}
+      conclusion: ${{ steps.wait_tests.outputs.conclusion }}
+
+    steps:
+      - name: Wait for GitHub Pages staging to refresh
+        run: sleep 30
+
+      - name: Dispatch test workflow in automation repo
+        id: send_tests
+        uses: actions/github-script@v7
+        env:
+          TARGET_OWNER: "jmiguelcheq"
+          TARGET_REPO: "appium-cucumber-framework-cicd"
+          STAGING_URL: "https://jmiguelcheq.github.io/appium-cucumber-calculator-staging/"
+        with:
+          github-token: ${{ secrets.CI_PAT }}
+          script: |
+            const payload = {
+              base_url: process.env.STAGING_URL,
+              target_env: 'staging',
+              source_repo: `${context.repo.owner}/${context.repo.repo}`,
+              sha: context.sha,
+              ref: context.ref.replace('refs/heads/', '')
+            };
+
+            await github.rest.repos.createDispatchEvent({
+              owner: process.env.TARGET_OWNER,
+              repo: process.env.TARGET_REPO,
+              event_type: 'run-mobile-tests',
+              client_payload: payload
+            });
+
+            core.info(`Dispatched payload: ${JSON.stringify(payload)}`);
+            core.setOutput("dispatched_at", new Date().toISOString());
+
+      - name: Wait for automation repo workflow result
+        id: wait_tests
+        uses: actions/github-script@v7
+        env:
+          TARGET_OWNER: "jmiguelcheq"
+          TARGET_REPO: "appium-cucumber-framework-cicd"
+          DISPATCHED_AT: ${{ steps.send_tests.outputs.dispatched_at }}
+        with:
+          github-token: ${{ secrets.CI_PAT }}
+          script: |
+            const { TARGET_OWNER, TARGET_REPO, DISPATCHED_AT } = process.env;
+            const workflow_id = 'on-dispatch-mobile-tests.yml';
+            const deadline = Date.now() + 40 * 60 * 1000;
+            const dispatchedAtMs = Date.parse(DISPATCHED_AT);
+
+            let runId = null;
+            let run = null;
+
+            while (Date.now() < deadline) {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: TARGET_OWNER,
+                repo: TARGET_REPO,
+                workflow_id,
+                event: 'repository_dispatch',
+                per_page: 20
+              });
+
+              const matched = runs.data.workflow_runs.find(
+                r => Date.parse(r.created_at) >= dispatchedAtMs
+              );
+
+              if (matched) {
+                runId = matched.id;
+                core.info(`Matched run id: ${runId}`);
+                break;
+              }
+
+              await new Promise(r => setTimeout(r, 5000));
+            }
+
+            if (!runId) {
+              core.setFailed("Could not find dispatched test run.");
+              return;
+            }
+
+            while (Date.now() < deadline) {
+              const res = await github.rest.actions.getWorkflowRun({
+                owner: TARGET_OWNER,
+                repo: TARGET_REPO,
+                run_id: runId
+              });
+
+              run = res.data;
+              core.info(`status=${run.status}, conclusion=${run.conclusion}`);
+
+              if (run.status === 'completed') break;
+              await new Promise(r => setTimeout(r, 10000));
+            }
+
+            if (!run) {
+              core.setFailed("No workflow run details found.");
+              return;
+            }
+
+            core.setOutput("run_url", run.html_url);
+            core.setOutput("conclusion", run.conclusion || "unknown");
+
+            if (run.conclusion !== "success") {
+              core.setFailed(`Staging tests failed: ${run.conclusion}`);
+            }
+
+  deploy_production:
+    name: Deploy Staging Content to Production Repo
+    needs: run_staging_tests
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://jmiguelcheq.github.io/appium-cucumber-calculator-prod/
+
+    steps:
+      - name: Checkout staging repo
+        uses: actions/checkout@v4
+
+      - name: Checkout production repo
+        uses: actions/checkout@v4
+        with:
+          repository: jmiguelcheq/appium-cucumber-calculator-prod
+          ref: main
+          token: ${{ secrets.CI_PAT }}
+          path: prod-repo
+
+      - name: Sync staging content to production repo
+        run: |
+          set -e
+          shopt -s dotglob
+
+          cd prod-repo
+
+          find . -mindepth 1 -maxdepth 1 \
+            ! -name '.git' \
+            ! -name 'README.md' \
+            -exec rm -rf {} +
+
+          for item in ../* ../.[!.]* ../..?*; do
+            name="$(basename "$item")"
+            if [ "$name" != ".git" ] && [ "$name" != ".github" ] && [ "$name" != "prod-repo" ]; then
+              cp -R "$item" .
+            fi
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git status --porcelain | grep .; then
+            git add .
+            git commit -m "Deploy production from staging commit ${GITHUB_SHA}"
+            git push origin main
+          else
+            echo "No changes to deploy to production."
+          fi
