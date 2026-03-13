@@ -148,7 +148,7 @@ jobs:
       - name: Sync staging content to production repo
         run: |
           set -e
-          shopt -s dotglob
+          shopt -s dotglob nullglob
 
           cd prod-repo
 
